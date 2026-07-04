@@ -3,28 +3,17 @@ import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { randomUUID } from 'crypto';
-import { GoogleGenAI, Type } from '@google/genai';
+import axios from 'axios';
 
 const PORT = 3000;
 
-// Initialize lazy-load client or standard client
-let aiClient: GoogleGenAI | null = null;
-function getAiClient() {
-  if (!aiClient) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      throw new Error('GEMINI_API_KEY environment variable is required. Please set it in Settings > Secrets.');
-    }
-    aiClient = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        }
-      }
-    });
+// Initialize NVIDIA API client
+function getNvidiaClient() {
+  const apiKey = process.env.NVIDIA_API_KEY;
+  if (!apiKey) {
+    throw new Error('NVIDIA_API_KEY environment variable is required. Please set it in Settings > Secrets.');
   }
-  return aiClient;
+  return apiKey;
 }
 
 // State interfaces
@@ -175,61 +164,51 @@ async function startServer() {
         return res.status(400).json({ error: 'At least one screenshot image is required.' });
       }
 
-      const ai = getAiClient();
+      const apiKey = getNvidiaClient();
       const allExtractedLeads: { name: string; phone: string }[] = [];
+      const invokeUrl = "https://integrate.api.nvidia.com/v1/chat/completions";
 
       for (const imageStr of images) {
         // Clean base64 data
-        let mimeType = 'image/png';
         let base64Data = imageStr;
         const match = imageStr.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/);
         if (match) {
-          mimeType = match[1];
           base64Data = match[2];
         }
 
-        const imagePart = {
-          inlineData: {
-            mimeType,
-            data: base64Data,
-          },
+        const headers = {
+          "Authorization": `Bearer ${apiKey}`,
+          "Accept": "application/json"
         };
 
-        const textPart = {
-          text: `You are an automated lead OCR scanner for Legal Success India. 
-Analyze this screenshot image. Identify all potential customer contact/lead details. 
-Specifically, extract any visible Names and Phone/Mobile numbers. 
-Return a JSON object matching the requested schema. Ensure to clean up the phone numbers (remove formatting characters like spaces, hyphens, brackets, but preserve country codes if relevant).
-If a contact name is missing but a phone number is visible, use a descriptive placeholder like "Lead - Mobile" or similar.
-If no contacts are found, return an empty array.`
-        };
-
-        const response = await ai.models.generateContent({
-          model: 'gemini-3.5-flash',
-          contents: { parts: [imagePart, textPart] },
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                leads: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      name: { type: Type.STRING, description: 'Name of the lead/contact' },
-                      phone: { type: Type.STRING, description: 'Clean phone number/mobile number' }
-                    },
-                    required: ['name', 'phone']
+        const payload = {
+          "model": "nvidia/neva-22b",
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": `You are an automated lead OCR scanner for Legal Success India. Analyze this screenshot image. Identify all potential customer contact/lead details. Specifically, extract any visible Names and Phone/Mobile numbers. Return a JSON object with a 'leads' array. Ensure to clean up the phone numbers (remove formatting characters like spaces, hyphens, brackets, but preserve country codes if relevant). If a contact name is missing but a phone number is visible, use a descriptive placeholder like "Lead - Mobile" or similar. If no contacts are found, return an empty array.`
+                },
+                {
+                  "type": "image_url",
+                  "image_url": {
+                    "url": `data:image/png;base64,${base64Data}`
                   }
                 }
-              },
-              required: ['leads']
+              ]
             }
-          }
-        });
+          ],
+          "max_tokens": 4096,
+          "temperature": 1.00,
+          "top_p": 0.95,
+          "stream": false
+        };
 
-        const textResult = response.text;
+        const response = await axios.post(invokeUrl, payload, { headers });
+        
+        const textResult = response.data.choices[0].message.content;
         if (textResult) {
           try {
             const parsed = JSON.parse(textResult.trim());
@@ -237,7 +216,7 @@ If no contacts are found, return an empty array.`
               allExtractedLeads.push(...parsed.leads);
             }
           } catch (e) {
-            console.error('Error parsing JSON response from Gemini:', e);
+            console.error('Error parsing JSON response from NVIDIA:', e);
           }
         }
       }
